@@ -1,0 +1,238 @@
+#include "Adafruit_NeoTrellis.h"
+#include "Adafruit_TinyUSB.h"
+#include <MIDI.h>
+
+// --- CONFIGURATION ---
+#define MATRIX_COLS 8
+#define MATRIX_ROWS 8
+#define DECAY_SPEED 4        // Smoky color trails for an organic lofi look
+
+// GLACIAL PHRASE CLOCK: 4.8 seconds per deep macro key transition
+#define METRONOME_SPEED 4800 
+int macroStep = 0;        
+int activeKeyCenter = 0;     // 0=C Minor, 1=E Major, 2=G Mixolydian, 3=Bb Dorian
+
+Adafruit_NeoTrellis t_array[MATRIX_ROWS/4][MATRIX_COLS/4] = {
+  { Adafruit_NeoTrellis(0x2E), Adafruit_NeoTrellis(0x2F) },
+  { Adafruit_NeoTrellis(0x30), Adafruit_NeoTrellis(0x31) }
+};
+Adafruit_MultiTrellis trellis((Adafruit_NeoTrellis *)t_array, MATRIX_ROWS/4, MATRIX_COLS/4);
+
+Adafruit_USBD_MIDI usb_midi;
+MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
+
+// --- STATE STORAGE ---
+bool currentGen[MATRIX_ROWS][MATRIX_COLS];
+bool nextGen[MATRIX_ROWS][MATRIX_COLS];
+
+uint8_t redChannel[MATRIX_ROWS][MATRIX_COLS];
+uint8_t greenChannel[MATRIX_ROWS][MATRIX_COLS];
+uint8_t blueChannel[MATRIX_ROWS][MATRIX_COLS];
+
+// --- THE 4 MACRO KEY MODAL SCALES (Roots transposed to a comfortable mid-register) ---
+const uint8_t keyRoots[] = { 36, 40, 43, 46 }; // C1, E1, G1, Bb1
+
+// 8-step modal slices that capture the Jan Hammer extensions (Minor 11th, Lydian, Mixolydian, Dorian)
+const uint8_t cMinorScale[]   = { 0, 2, 3, 5, 7, 8, 10, 11 }; // C Dorian/Minor hybrid
+const uint8_t eMajorScale[]   = { 0, 2, 4, 6, 7, 9, 11, 13 }; // E Lydian focus
+const uint8_t gMixolydScale[]  = { 0, 2, 4, 5, 7, 9, 10, 11 }; // G Mixolydian focus
+const uint8_t bbDorianScale[] = { 0, 2, 3, 5, 7, 9, 10, 12 }; // Bb Dorian Bitches Brew
+
+unsigned long lastClockPulse = 0;
+unsigned long lastVisualFade = 0;
+uint8_t lastSentCC = 0;
+
+void runFusionEngine();
+void updateGlowTrails();
+int countNeighbors(int r, int c);
+void modulateGlobalFilters(int totalCells);
+void playLinearMatrixNote(int row, int col, bool isOn);
+
+TrellisCallback blink(keyEvent evt) {
+  if (evt.bit.EDGE == SEESAW_KEYPAD_EDGE_RISING) {
+    int keyNum = evt.bit.NUM;
+    int col = keyNum % MATRIX_COLS;
+    int row = keyNum / MATRIX_COLS;
+    
+    currentGen[row][col] = true;
+    
+    // Impact Visual: Saturated Miles Davis Crimson & Amber
+    redChannel[row][col] = 160;
+    greenChannel[row][col] = 40;
+    blueChannel[row][col] = 10;
+    
+    playLinearMatrixNote(row, col, true);
+  }
+  return 0;
+}
+
+void setup() {
+  usb_midi.setStringDescriptor("Planets Linear Core");
+  MIDI.begin(MIDI_CHANNEL_OMNI);
+
+  while (!TinyUSBDevice.mounted()) {
+    delay(10); 
+  }
+  delay(300);
+
+  if(!trellis.begin()){
+    while(1);
+  }
+
+  for(int y=0; y<MATRIX_ROWS; y++){
+    for(int x=0; x<MATRIX_COLS; x++){
+      trellis.activateKey(x, y, SEESAW_KEYPAD_EDGE_RISING, true);
+      trellis.registerCallback(x, y, blink);
+      currentGen[y][x] = (random(0, 100) < 14); 
+    }
+  }
+}
+
+void loop() {
+  trellis.read(); 
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastClockPulse >= METRONOME_SPEED) {
+    runFusionEngine();
+    macroStep = (macroStep + 1) % 16; 
+    lastClockPulse = currentMillis;
+  }
+  
+  if (currentMillis - lastVisualFade >= 30) {
+    updateGlowTrails();
+    lastVisualFade = currentMillis;
+  }
+}
+
+void runFusionEngine() {
+  int totalActiveCells = 0;
+
+  // --- MACRO MODULATION CYCLE ---
+  if (macroStep == 0)       activeKeyCenter = 0; // C Minor
+  else if (macroStep == 4)  activeKeyCenter = 1; // E Major
+  else if (macroStep == 8)  activeKeyCenter = 2; // G Mixolydian
+  else if (macroStep == 12) activeKeyCenter = 3; // Bb Dorian
+
+  // Gentle root pedal drone anchor
+  if (macroStep % 4 == 0) {
+    MIDI.sendNoteOn(keyRoots[activeKeyCenter], 32, 1); 
+  } else if (macroStep % 4 == 3) {
+    MIDI.sendNoteOff(keyRoots[activeKeyCenter], 0, 1);
+  }
+
+  for (int r = 0; r < MATRIX_ROWS; r++) {
+    for (int c = 0; c < MATRIX_COLS; c++) {
+      int neighbors = countNeighbors(r, c);
+      
+      if (currentGen[r][c]) {
+        nextGen[r][c] = (neighbors == 2 || neighbors == 3);
+        if(nextGen[r][c]) totalActiveCells++;
+      } else {
+        nextGen[r][c] = (neighbors == 3);
+        if(nextGen[r][c]) totalActiveCells++;
+      }
+      
+      if (nextGen[r][c]) {
+        // Render colors dynamically tracking the active key centers
+        if (activeKeyCenter == 0)      { redChannel[r][c] = 20; greenChannel[r][c] = 0;  blueChannel[r][c] = 4; }  
+        else if (activeKeyCenter == 1) { redChannel[r][c] = 0;  greenChannel[r][c] = 18; blueChannel[r][c] = 20; } 
+        else if (activeKeyCenter == 2) { redChannel[r][c] = 25; greenChannel[r][c] = 12; blueChannel[r][c] = 0; }  
+        else                           { redChannel[r][c] = 14; greenChannel[r][c] = 2;  blueChannel[r][c] = 25; } 
+        
+        if(!currentGen[r][c]) { 
+           playLinearMatrixNote(r, c, true);
+        }
+      } else {
+        if(currentGen[r][c]) {
+           playLinearMatrixNote(r, c, false);
+        }
+      }
+    }
+  }
+
+  if (totalActiveCells < 4) {
+    for (int i = 0; i < 2; i++) {
+      nextGen[random(0, MATRIX_ROWS)][random(0, MATRIX_COLS)] = true; 
+    }
+  }
+
+  // Organic slow spatial shift
+  if (macroStep % 2 == 0) {
+    for (int r = MATRIX_ROWS - 1; r > 0; r--) {
+      for (int c = MATRIX_COLS - 1; c > 0; c--) {
+        nextGen[r][c] = nextGen[r - 1][c - 1];
+      }
+    }
+  }
+  
+  modulateGlobalFilters(totalActiveCells);
+  memcpy(currentGen, nextGen, sizeof(currentGen));
+}
+
+// FIX: ISOMORPHIC 64-PAD CONTINUOUS KEYBOARD ROUTING
+void playLinearMatrixNote(int row, int col, bool isOn) {
+  uint8_t baseRoot = keyRoots[activeKeyCenter];
+  const uint8_t* activeScale;
+  
+  if (activeKeyCenter == 0)      activeScale = cMinorScale;
+  else if (activeKeyCenter == 1) activeScale = eMajorScale;
+  else if (activeKeyCenter == 2) activeScale = gMixolydScale;
+  else                           activeScale = bbDorianScale;
+
+  // Modern grid architecture logic calculation:
+  // Convert 2D coordinates into a continuous, unbroken 1D index mapping sequence.
+  // Invert the row index (MATRIX_ROWS - 1 - row) so pitches cleanly climb upwards as you move up the physical surface.
+  int absoluteScaleStep = (col) + ((MATRIX_ROWS - 1 - row) * 5); // +5 step vertical stringed instrument offset offset
+
+  // Pull note pitch out of our modal interval pools using infinite array wrapping math
+  int octaveShift = absoluteScaleStep / 8;
+  int scaleIndex  = absoluteScaleStep % 8;
+  
+  uint8_t targetNote = baseRoot + activeScale[scaleIndex] + (octaveShift * 12);
+
+  // Transpose baseline slightly up to avoid sub frequencies on top keys
+  targetNote += 12; 
+
+  if (isOn) {
+    MIDI.sendNoteOn(targetNote, 45, 1); 
+  } else {
+    MIDI.sendNoteOff(targetNote, 0, 1);
+  }
+}
+
+int countNeighbors(int r, int c) {
+  int count = 0;
+  for (int i = -1; i <= 1; i++) {
+    for (int j = -1; j <= 1; j++) {
+      if (i == 0 && j == 0) continue;
+      int row = (r + i + MATRIX_ROWS) % MATRIX_ROWS;
+      int col = (c + j + MATRIX_COLS) % MATRIX_COLS;
+      if (currentGen[row][col]) count++;
+    }
+  }
+  return count;
+}
+
+void updateGlowTrails() {
+  for (int r = 0; r < MATRIX_ROWS; r++) {
+    for (int c = 0; c < MATRIX_COLS; c++) {
+      if (!currentGen[r][c]) {
+        redChannel[r][c]   = (redChannel[r][c] > DECAY_SPEED)   ? redChannel[r][c] - DECAY_SPEED : 0;
+        greenChannel[r][c] = (greenChannel[r][c] > DECAY_SPEED) ? greenChannel[r][c] - DECAY_SPEED : 0;
+        blueChannel[r][c]  = (blueChannel[r][c] > DECAY_SPEED)  ? blueChannel[r][c] - DECAY_SPEED : 0;
+      }
+      uint32_t mixedColor = ((uint32_t)redChannel[r][c] << 16) | ((uint32_t)greenChannel[r][c] << 8) | blueChannel[r][c];
+      trellis.setPixelColor(c, r, mixedColor);
+    }
+  }
+  trellis.show();
+}
+
+void modulateGlobalFilters(int totalCells) {
+  uint8_t targetCCValue = map(totalCells, 0, 45, 0, 127);
+  if(targetCCValue > 127) targetCCValue = 127;
+  if (targetCCValue != lastSentCC) {
+    MIDI.sendControlChange(1, targetCCValue, 1); 
+    lastSentCC = targetCCValue;
+  }
+}
